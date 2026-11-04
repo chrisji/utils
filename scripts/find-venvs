@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""
+Find Python virtual environments (.venv/ and venv/) left over from pre-uv
+workflows, report their size, and optionally delete them.
+
+A directory only counts if it contains pyvenv.cfg, so a folder that happens to
+be called "venv" is never touched. Environments created by uv are kept by
+default: `uv sync` / `uv run` also create .venv/, and those are the ones
+you're moving to. uv writes a `uv = <version>` line to pyvenv.cfg, which is how
+they are told apart.
+
+Usage:
+    find-venvs [ROOT ...]                 # list (default root: ~/dev)
+    find-venvs --older-than 90            # only ones untouched for 90+ days
+    find-venvs --include-uv               # also list uv-managed environments
+    find-venvs --delete                   # ask before deleting each one
+    find-venvs --delete --yes             # delete everything listed, no prompts
+
+Deleting is safe in the sense that a venv holds no source code: it can be
+rebuilt from the project's requirements/pyproject. Anything installed into it
+by hand, and not recorded anywhere, is lost.
+"""
+
+import argparse
+import os
+import shutil
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+VENV_NAMES = {".venv", "venv"}
+
+# Never worth descending into: huge, and never contain a project's own venv.
+SKIP_DIRS = {
+    ".git", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache",
+    ".ruff_cache", ".tox", ".nox", "site-packages", ".Trash", "Library",
+}
+
+
+@dataclass
+class Venv:
+    path: Path
+    manager: str        # "uv", "venv", "virtualenv" or "unknown"
+    python: str
+    size: int
+    last_used: float    # newest mtime of the env's bin/ or pyvenv.cfg
+
+    @property
+    def age_days(self) -> int:
+        return int((time.time() - self.last_used) // 86400)
+
+
+def read_pyvenv_cfg(cfg: Path) -> dict:
+    values = {}
+    try:
+        for line in cfg.read_text(errors="replace").splitlines():
+            if "=" in line:
+                key, _, value = line.partition("=")
+                values[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return values
+
+
+def classify(cfg: dict) -> str:
+    if "uv" in cfg:
+        return "uv"
+    if "virtualenv" in cfg:
+        return "virtualenv"
+    if "command" in cfg and "-m venv" in cfg["command"]:
+        return "venv"
+    return "unknown"
+
+
+def dir_size(path: Path) -> int:
+    """Bytes on disk, without following symlinks (venvs symlink their python)."""
+    total = 0
+    for dirpath, _, filenames in os.walk(path, followlinks=False):
+        for name in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def last_used(path: Path) -> float:
+    """
+    When the env was last changed - created, or a package installed. Reads
+    only bin/ and pyvenv.cfg, so it doesn't walk every file in site-packages.
+    """
+    candidates = [path / "pyvenv.cfg", path / "bin", path / "Scripts"]
+    times = [p.stat().st_mtime for p in candidates if p.exists()]
+    return max(times) if times else path.stat().st_mtime
+
+
+def find_venvs(roots: list[Path]):
+    for root in roots:
+        for dirpath, dirnames, _ in os.walk(root, followlinks=False):
+            found = []
+            for name in dirnames:
+                if name in VENV_NAMES and (Path(dirpath, name) / "pyvenv.cfg").is_file():
+                    found.append(name)
+            for name in found:
+                path = Path(dirpath, name)
+                cfg = read_pyvenv_cfg(path / "pyvenv.cfg")
+                yield Venv(
+                    path=path,
+                    manager=classify(cfg),
+                    python=cfg.get("version") or cfg.get("version_info") or "?",
+                    size=dir_size(path),
+                    last_used=last_used(path),
+                )
+            # Don't descend into venvs we've found, or into directories that
+            # can't contain a project's venv.
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in found and d not in SKIP_DIRS
+            ]
+
+
+def human(size: int) -> str:
+    for unit in ("B", "K", "M", "G"):
+        if size < 1024 or unit == "G":
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}G"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Find (and optionally delete) old Python virtualenvs.",
+    )
+    parser.add_argument("roots", nargs="*", type=Path, default=[Path.home() / "dev"],
+                        help="directories to search (default: ~/dev)")
+    parser.add_argument("--older-than", type=int, metavar="DAYS", default=0,
+                        help="only environments not changed in DAYS days")
+    parser.add_argument("--include-uv", action="store_true",
+                        help="also include uv-managed environments")
+    parser.add_argument("--delete", action="store_true",
+                        help="delete the listed environments (asks for each)")
+    parser.add_argument("--yes", action="store_true",
+                        help="with --delete, don't ask")
+    args = parser.parse_args()
+
+    for root in args.roots:
+        if not root.is_dir():
+            parser.error(f"not a directory: {root}")
+
+    print(f"Searching {', '.join(str(r) for r in args.roots)} ...", file=sys.stderr)
+    venvs = [
+        v for v in find_venvs([r.expanduser().resolve() for r in args.roots])
+        if (args.include_uv or v.manager != "uv") and v.age_days >= args.older_than
+    ]
+    venvs.sort(key=lambda v: v.size, reverse=True)
+
+    if not venvs:
+        print("No matching virtualenvs found.")
+        return 0
+
+    print(f"{'SIZE':>8}  {'AGE':>6}  {'MANAGER':<10} {'PYTHON':<8} PATH")
+    for v in venvs:
+        print(f"{human(v.size):>8}  {v.age_days:>5}d  {v.manager:<10} {v.python:<8} {v.path}")
+    total = sum(v.size for v in venvs)
+    print(f"\n{len(venvs)} environments, {human(total)} total.")
+
+    if not args.delete:
+        print("Dry run - nothing deleted. Re-run with --delete to remove them.")
+        return 0
+
+    freed = 0
+    for v in venvs:
+        if not args.yes:
+            answer = input(f"Delete {v.path} ({human(v.size)})? [y/N/q] ").strip().lower()
+            if answer == "q":
+                break
+            if answer != "y":
+                continue
+        # Re-check right before deleting: never remove something that isn't a venv.
+        if not (v.path / "pyvenv.cfg").is_file():
+            print(f"  skipped (no pyvenv.cfg any more): {v.path}")
+            continue
+        shutil.rmtree(v.path)
+        freed += v.size
+        print(f"  deleted {v.path}")
+
+    print(f"\nFreed {human(freed)}.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
